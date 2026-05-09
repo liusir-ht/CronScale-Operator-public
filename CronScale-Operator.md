@@ -1,174 +1,187 @@
-## 问题背景
+# CronScale Operator 说明文档
 
-最近在研究 Kubernetes Operator，希望通过自定义资源的方式解决业务定时扩缩容的问题。
+## 背景
 
-在实际业务中，经常会遇到这种场景：每天固定时间段流量上涨，需要提前扩容；流量下降后，又需要自动缩容。如果完全依赖人工操作，容易出现扩容不及时、缩容遗漏、资源浪费等问题。
+很多业务的流量具有明显周期性，例如白天高峰需要提前扩容，夜间低峰需要自动缩容。如果完全依赖人工调整，容易出现扩容不及时、缩容遗漏和资源浪费。
 
-所以这里基于 Kubebuilder 实现了一个 `CronScale-Operator`，主要提供两个能力：
+`CronScale Operator` 使用 Kubernetes CRD 描述定时扩缩容规则，由 Operator 监听 `CronScale` 资源并在指定时间执行动作。除了调整 Deployment 副本数，它还支持在扩容前提前把业务镜像拉取到目标节点，降低 Pod 启动时的镜像拉取等待时间。
 
-| 能力 | 说明 |
+## 功能概览
+
+| 功能 | 说明 |
 | --- | --- |
-| 定时扩缩容 | 按照配置的 cron 时间，自动调整 Deployment 副本数 |
-| 镜像预热 | 在扩容前提前把业务镜像拉取到目标节点，减少 Pod 启动耗时 |
+| 定时扩容 | 到达 `spec.add.scaleTime` 后，将目标 Deployment 调整到 `spec.add.targetReplicas` |
+| 定时缩容 | 到达 `spec.minus.scaleTime` 后，将目标 Deployment 调整到 `spec.minus.targetReplicas` |
+| HPA 兼容 | 如果目标 Deployment 配置了同名 HPA，扩缩容时同步调整 HPA 的 `minReplicas` 和 `maxReplicas` |
+| 镜像预热 | 到达 `spec.imagePullTime` 后，计算缺少目标镜像的节点，并创建临时 Job 执行 `crictl pull` |
+| 任务清理 | 删除 `CronScale` 资源时，清理该资源注册过的 cron 任务 |
 
-项目通过 `CronScale` 自定义资源描述扩容时间、缩容时间、目标副本数和镜像预热时间。Operator 监听到资源后，会自动注册定时任务，到时间后执行对应操作。
-
-## 环境介绍
-
-| 组件名称 | 组件版本 | 组件作用 |
-| --- | --- | --- |
-| Kubernetes | v1.11.3+ | Operator 运行环境，负责管理 Deployment、Job、CRD 等资源 |
-| Go | v1.21.0+ | 编译 Operator 和 cronscale-agent |
-| Docker | v17.03+ | 构建和推送 Operator 镜像 |
-| kubectl | v1.11.3+ | 安装 CRD、部署资源、查看运行状态 |
-| Kubebuilder | controller-runtime v0.17.2 | Operator 开发框架 |
-| containerd | 集群节点运行时 | 提供节点镜像管理能力 |
-| MySQL | 自建实例 | 存储节点和镜像的对应关系 |
-| cronscale-agent | 项目内组件 | 以 DaemonSet 方式采集每个节点已有镜像 |
-
-## 核心架构
-
-| 模块 | 路径 | 作用 |
-| --- | --- | --- |
-| CRD 定义 | `api/v1/cronscale_types.go` | 定义 `CronScale` 资源字段 |
-| Webhook 校验 | `api/v1/cronscale_webhook.go` | 校验扩容副本数、缩容副本数、执行时间等参数 |
-| Controller | `internal/controller/cronscale_controller.go` | 监听 `CronScale` 资源，注册定时扩缩容和镜像预热任务 |
-| HPA 工具 | `pkg/hpa.go` | 当业务配置 HPA 时，同步调整 HPA 的副本上下限 |
-| agent | `cronscale-agent/main.go` | 扫描节点本地镜像，并写入 MySQL |
-
-整体流程：
+## 架构
 
 ```text
-创建 CronScale 资源
-        |
-        v
-Operator 监听资源变化
-        |
-        v
-注册扩容、缩容、镜像预热 cron 任务
-        |
-        v
-到达指定时间后执行任务
-        |
-        v
-更新 Deployment / HPA 或创建镜像预热 Job
+CronScale YAML
+      |
+      v
+Kubernetes API Server
+      |
+      v
+CronScale Controller
+      |
+      +-- 注册扩容任务
+      +-- 注册缩容任务
+      +-- 注册镜像预热任务
+      |
+      v
+到达 cron 时间后执行
+      |
+      +-- 更新 Deployment / HPA
+      +-- 查询 MySQL 节点镜像数据
+      +-- 创建镜像预热 Job
 ```
 
-## 代码关键节点说明
+组件职责：
 
-| 关键节点 | 代码位置 | 说明 |
+| 组件 | 路径 | 作用 |
 | --- | --- | --- |
-| 初始化 Kubernetes Client | `pkg/client.go` | `kubeconfig` 默认设置为空，public 仓库不提交真实集群凭据；本地调试时再按环境填入 |
-| 初始化 MySQL Client | `pkg/client.go`、`cronscale-agent/main.go` | `dsn` 默认设置为空，public 仓库不提交数据库账号、密码、地址等敏感信息 |
-| 注册定时任务 | `internal/controller/cronscale_controller.go` | `ReconcileReplicas` 注册扩容和缩容任务，`ReconcileImage` 注册镜像预热任务 |
-| 清理定时任务 | `internal/controller/cronscale_controller.go` | 删除 `CronScale` 资源时，通过 `taskMap` 找到已经注册的 cron task id 并移除 |
-| HPA 兼容处理 | `internal/controller/cronscale_controller.go`、`pkg/hpa.go` | 如果业务存在 HPA，优先调整 HPA 的 `minReplicas` 和 `maxReplicas`，避免 HPA 覆盖副本数 |
-| Deployment 副本调整 | `internal/controller/cronscale_controller.go` | 没有 HPA 或 HPA 处理完成后，通过 Deployment 的 Scale 子资源更新副本数 |
-| agent 镜像上报 | `cronscale-agent/main.go` | agent 每 5 秒读取节点 containerd 镜像列表，并写入 MySQL |
-| 镜像预热节点计算 | `internal/controller/cronscale_controller.go` | Operator 查询 MySQL 中已有目标镜像的节点，再计算出还需要预热的节点列表 |
-| 镜像预热 Job | `internal/controller/cronscale_controller.go` | 对缺少镜像的节点创建临时 Job，在节点上执行 `crictl pull` |
-| Job 自动回收 | `internal/controller/cronscale_controller.go` | 轮询 Job 状态，任务完成后删除临时 Job，避免资源残留 |
+| CRD 类型定义 | `api/v1/cronscale_types.go` | 定义 `CronScale` 的 spec 和 status |
+| Webhook 校验 | `api/v1/cronscale_webhook.go` | 校验副本数、时间字段和 Deployment 名称 |
+| Controller | `internal/controller/cronscale_controller.go` | 监听资源、注册定时任务、执行扩缩容和镜像预热 |
+| HPA 工具 | `pkg/hpa.go` | 查询和更新 HPA 副本上下限 |
+| Kubernetes Client | `pkg/client.go` | 初始化 Kubernetes clientset |
+| MySQL Client | `pkg/client.go`、`cronscale-agent/main.go` | 连接 MySQL，读写节点镜像信息 |
+| cronscale-agent | `cronscale-agent/main.go` | 以 DaemonSet 方式运行，定时上报节点已有镜像 |
 
-这里需要注意，示例代码为了适合公开仓库，已经将 kubeconfig、MySQL DSN、私有镜像仓库地址、内网节点 IP 等信息替换为空值或示例值。实际部署时建议通过 Kubernetes Secret、ConfigMap 或环境变量注入。
+## 部署前初始化参数
 
-## 核心步骤
+公开仓库不会提交真实 kubeconfig、数据库账号密码、私有镜像仓库地址或内网节点信息。部署前需要按环境补齐下面这些参数。
 
-### 部署CronScale-Operator镜像
+| 参数 | 必填 | 示例 | 配置位置 | 说明 |
+| --- | --- | --- | --- | --- |
+| `IMG` | 是 | `registry.example.com/cronscale-operator:v0.1.0` | `make docker-build docker-push deploy IMG=...` | Operator 镜像地址 |
+| `AGENT_IMG` | 镜像预热必填 | `registry.example.com/cronscale-agent:v0.1.0` | `config/samples/Cronscale-agent.yaml` | agent DaemonSet 镜像 |
+| `TASK_IMG` | 镜像预热必填 | `registry.example.com/cronscale-task:3.16` | `internal/controller/cronscale_controller.go` 或镜像预热 Job 模板 | 执行 `crictl pull` 的工具镜像 |
+| `NAMESPACE` | 是 | `default` / `liuchong` | CronScale YAML、agent YAML、目标 Deployment | CronScale 和目标 Deployment 必须在同一命名空间 |
+| `MYSQL_DSN` | 镜像预热必填 | `user:password@tcp(mysql:3306)/cronscale?parseTime=true` | `pkg/client.go`、`cronscale-agent/main.go` | Operator 查询镜像数据，agent 写入镜像数据 |
+| `KUBECONFIG` | 本地运行必填 | `~/.kube/config` | `pkg/client.go` | 本地调试时使用；集群内运行建议使用 ServiceAccount |
+| `CONTAINERD_SOCKET` | 镜像预热必填 | `/run/containerd/containerd.sock` | `pkg/client.go`、`cronscale-agent/main.go`、DaemonSet volume | 连接宿主机 containerd |
+| `CONTAINERD_DATA` | 镜像预热按需 | `/data/containerd` | `config/samples/Cronscale-agent.yaml`、预热 Job volume | 挂载宿主机 containerd 数据目录 |
 
-```bash
-make docker-build docker-push IMG=<registry>/cronscale-operator:<tag>
+当前代码中需要重点替换的示例值：
+
+| 文件 | 当前示例 | 建议 |
+| --- | --- | --- |
+| `pkg/client.go` | `kubeconfig := ""` | 本地调试填 kubeconfig 路径；生产建议改成集群内配置 |
+| `pkg/client.go` | `dsn := ""` | 改为从 Secret / 环境变量读取 MySQL DSN |
+| `cronscale-agent/main.go` | `dsn := ""` | 改为从 Secret / 环境变量读取 MySQL DSN |
+| `config/samples/Cronscale-agent.yaml` | `example.com/library/cronscale-agent:1.0.2` | 替换为真实 agent 镜像 |
+| `internal/controller/cronscale_controller.go` | `example.com/library/cronscale-task:3.16` | 替换为真实预热工具镜像 |
+| `config/samples/*.yaml` | `namespace: liuchong` | 替换为目标业务命名空间 |
+
+建议后续把 `dsn`、`kubeconfig`、工具镜像和 containerd 路径改成环境变量或 ConfigMap / Secret 注入，避免每个环境都重新编译镜像。
+
+## MySQL 初始化
+
+镜像预热能力依赖 MySQL 保存“节点 - 镜像”的关系。agent 每 5 秒扫描一次节点镜像并写入表，Operator 根据目标 Deployment 镜像查询哪些节点已经存在该镜像。
+
+建议建表：
+
+```sql
+CREATE DATABASE IF NOT EXISTS cronscale DEFAULT CHARACTER SET utf8mb4;
+
+CREATE TABLE IF NOT EXISTS cronscale_agent (
+  id BIGINT PRIMARY KEY AUTO_INCREMENT,
+  node_ip VARCHAR(255) NOT NULL COMMENT '节点名称或节点标识',
+  image_name VARCHAR(512) NOT NULL COMMENT '节点上已有镜像',
+  update_time TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  UNIQUE KEY uniq_node_image (node_ip, image_name),
+  KEY idx_image_name (image_name),
+  KEY idx_update_time (update_time)
+);
 ```
 
-示例：
+DSN 示例：
 
-```bash
-make docker-build docker-push IMG=example.com/library/cronscale-operator:1.0.0
+```text
+cronscale:password@tcp(mysql.cronscale-system.svc:3306)/cronscale?charset=utf8mb4&parseTime=true&loc=Local
 ```
 
-#### 参数解释
+生产环境建议：
+
+| 项目 | 建议 |
+| --- | --- |
+| 账号权限 | 只授予 `cronscale_agent` 表的 `SELECT`、`INSERT`、`UPDATE`、`DELETE` 权限 |
+| 密码管理 | 使用 Kubernetes Secret 注入，不要写入 Git 仓库 |
+| 高可用 | MySQL 地址使用稳定服务名或代理地址 |
+| 数据保留 | 当前 agent 会删除 5 秒未刷新的记录，确保 agent 正常运行后再启用镜像预热 |
+
+## 构建和部署
+
+### 1. 构建 Operator 镜像
+
+```bash
+make docker-build docker-push IMG=registry.example.com/cronscale-operator:v0.1.0
+```
+
+参数说明：
 
 | 参数 | 说明 |
 | --- | --- |
-| `make docker-build` | 根据项目根目录的 `Dockerfile` 构建 Operator 镜像 |
-| `make docker-push` | 将构建好的 Operator 镜像推送到镜像仓库 |
-| `IMG` | 指定镜像完整地址，例如 `example.com/library/cronscale-operator:1.0.0` |
-| `<registry>` | 镜像仓库地址 |
-| `<tag>` | 镜像版本号 |
+| `IMG` | Operator 镜像完整地址 |
+| `CONTAINER_TOOL` | 构建工具，默认是 `docker`，可设置为 `podman` |
+| `PLATFORMS` | 使用 `make docker-buildx` 时的多架构平台列表 |
 
-### 安装CronScale CRD
+### 2. 安装 CRD
 
 ```bash
 make install
 ```
 
-#### 参数解释
+该命令会安装 `cronscales.application.liuchong.cn`。
 
-| 参数 | 说明 |
-| --- | --- |
-| `make install` | 安装项目中的 CRD 资源 |
-| `config/crd` | CRD 配置目录 |
-| `cronscales.application.liuchong.cn` | 安装后生成的自定义资源类型 |
-
-### 部署CronScale-Operator
+### 3. 部署 Operator
 
 ```bash
-make deploy IMG=<registry>/cronscale-operator:<tag>
+make deploy IMG=registry.example.com/cronscale-operator:v0.1.0
 ```
 
-示例：
+默认会部署到 `cronscale-operator-system` 命名空间。这个值来自 `config/default/kustomization.yaml`。
+
+### 4. 部署 cronscale-agent
+
+如果只需要定时扩缩容，可以跳过 agent 和 MySQL。
+
+如果需要镜像预热，需要先构建并推送 agent 镜像。`cronscale-agent/Dockerfile` 会把已经编译好的 `cronscale-agent` 二进制打进镜像，所以需要先执行 `go build`：
 
 ```bash
-make deploy IMG=example.com/library/cronscale-operator:1.0.0
+cd cronscale-agent
+GOOS=linux GOARCH=amd64 go build -o cronscale-agent .
+docker build -t registry.example.com/cronscale-agent:v0.1.0 .
+docker push registry.example.com/cronscale-agent:v0.1.0
+cd ..
 ```
 
-#### 参数解释
+如果集群节点不是 amd64，需要把 `GOARCH` 改成实际架构，例如 `arm64`。
 
-| 参数 | 说明 |
-| --- | --- |
-| `make deploy` | 部署 Controller Manager、RBAC、Webhook 等资源 |
-| `IMG` | 指定 Controller Manager 使用的镜像 |
-| `config/default` | Operator 默认部署配置 |
-| `config/manager` | Controller Manager Deployment 配置 |
-| `config/rbac` | Operator 访问 Kubernetes API 所需权限 |
+然后替换 `config/samples/Cronscale-agent.yaml` 中的镜像、命名空间和宿主机路径：
 
-### 部署cronscale-agent
+```yaml
+containers:
+  - name: cronscale-agent
+    image: registry.example.com/cronscale-agent:v0.1.0
+    env:
+      - name: nodeName
+        valueFrom:
+          fieldRef:
+            fieldPath: spec.nodeName
+```
 
-如果只使用定时扩缩容能力，可以跳过这一步。
-
-如果需要镜像预热能力，需要部署 `cronscale-agent`，让每个节点定时上报本机已有镜像。
+部署：
 
 ```bash
 kubectl apply -f config/samples/Cronscale-agent.yaml
 ```
 
-#### 参数解释
-
-| 参数 | 说明 |
-| --- | --- |
-| `kubectl apply` | 创建或更新 Kubernetes 资源 |
-| `config/samples/Cronscale-agent.yaml` | agent 的 DaemonSet 配置文件 |
-| `DaemonSet` | 保证每个节点运行一个 agent Pod |
-| `/run/containerd` | 挂载宿主机 containerd socket |
-| `/data/containerd` | 挂载宿主机 containerd 数据目录 |
-| `nodeName` | 通过 Downward API 获取当前节点名称 |
-
-agent 的主要逻辑：
-
-```text
-每 5 秒扫描一次节点本地镜像
-        |
-        v
-读取 containerd 镜像列表
-        |
-        v
-将 nodeName 和 imageName 写入 MySQL
-```
-
-### 创建CronScale资源
-
-```bash
-kubectl apply -f config/samples/application_v1_cronscale.yaml
-```
+## CronScale 资源配置
 
 示例：
 
@@ -181,236 +194,193 @@ metadata:
   labels:
     env: test
 spec:
-  foo: CronScale-test
-  minus:
-    targetReplicas: 1
-    scaleTime: "0 */3 * * * ?"
+  deploymentName: nginx
   add:
     targetReplicas: 5
     scaleTime: "0 */5 * * * ?"
-  deploymentName: "nginx"
+  minus:
+    targetReplicas: 1
+    scaleTime: "0 */3 * * * ?"
   imagePullTime: "0 */1 * * * ?"
 ```
 
-#### 参数解释
+字段说明：
 
-| 参数 | 说明 |
-| --- | --- |
-| `apiVersion` | CRD API 版本，当前为 `application.liuchong.cn/v1` |
-| `kind` | 自定义资源类型，当前为 `CronScale` |
-| `metadata.name` | CronScale 资源名称 |
-| `metadata.namespace` | CronScale 所在命名空间，需要和目标 Deployment 保持一致 |
-| `spec.deploymentName` | 需要被扩缩容的 Deployment 名称 |
-| `spec.add.targetReplicas` | 扩容后的目标副本数 |
-| `spec.add.scaleTime` | 扩容执行时间，支持秒级 cron 表达式 |
-| `spec.minus.targetReplicas` | 缩容后的目标副本数 |
-| `spec.minus.scaleTime` | 缩容执行时间，支持秒级 cron 表达式 |
-| `spec.imagePullTime` | 镜像预热执行时间，支持秒级 cron 表达式 |
-
-上面的配置含义：
-
-| 配置 | 含义 |
-| --- | --- |
-| `add.targetReplicas: 5` | 扩容时将 `nginx` 调整到 5 个副本 |
-| `add.scaleTime: "0 */5 * * * ?"` | 每 5 分钟执行一次扩容任务 |
-| `minus.targetReplicas: 1` | 缩容时将 `nginx` 调整到 1 个副本 |
-| `minus.scaleTime: "0 */3 * * * ?"` | 每 3 分钟执行一次缩容任务 |
-| `imagePullTime: "0 */1 * * * ?"` | 每 1 分钟执行一次镜像预热任务 |
-
-### 扩缩容执行逻辑
-
-Operator 监听到 `CronScale` 后，会注册两个副本调整任务：
-
-| 任务 | 触发字段 | 执行动作 |
+| 字段 | 是否必填 | 说明 |
 | --- | --- | --- |
-| 扩容任务 | `spec.add.scaleTime` | 将目标 Deployment 调整到 `spec.add.targetReplicas` |
-| 缩容任务 | `spec.minus.scaleTime` | 将目标 Deployment 调整到 `spec.minus.targetReplicas` |
+| `apiVersion` | 是 | 固定为 `application.liuchong.cn/v1` |
+| `kind` | 是 | 固定为 `CronScale` |
+| `metadata.name` | 是 | CronScale 资源名称 |
+| `metadata.namespace` | 是 | 资源所在命名空间，需要和目标 Deployment 一致 |
+| `spec.deploymentName` | 是 | 目标 Deployment 名称 |
+| `spec.add.targetReplicas` | 是 | 扩容目标副本数，必须大于 `spec.minus.targetReplicas` |
+| `spec.add.scaleTime` | 是 | 扩容时间，秒级 cron 表达式 |
+| `spec.minus.targetReplicas` | 是 | 缩容目标副本数 |
+| `spec.minus.scaleTime` | 是 | 缩容时间，秒级 cron 表达式 |
+| `spec.imagePullTime` | 是 | 镜像预热时间，秒级 cron 表达式 |
+| `spec.foo` | 否 | 示例字段，当前业务逻辑未使用 |
 
-如果目标 Deployment 没有配置 HPA，Operator 会直接更新 Deployment 的 Scale 子资源。
+Webhook 当前校验规则：
 
-如果目标 Deployment 配置了 HPA，Operator 会优先更新 HPA 的 `minReplicas` 和 `maxReplicas`，避免 HPA 把副本数重新调整回去。
+| 规则 | 错误处理 |
+| --- | --- |
+| `add.targetReplicas` 必须大于 `minus.targetReplicas` | 拒绝创建或更新 |
+| `add.scaleTime` 不能为空 | 拒绝创建或更新 |
+| `add.targetReplicas` 不能为 0 | 拒绝创建或更新 |
+| `minus.scaleTime` 不能为空 | 拒绝创建或更新 |
+| `deploymentName` 不能为空 | 拒绝创建或更新 |
+| `imagePullTime` 不能为空 | 拒绝创建或更新 |
 
-### 镜像预热执行逻辑
+cron 表达式使用秒级格式，示例：
 
-镜像预热主要用于减少扩容时的镜像拉取时间。
+| 表达式 | 含义 |
+| --- | --- |
+| `0 */5 * * * ?` | 每 5 分钟执行一次 |
+| `0 0 9 * * ?` | 每天 09:00 执行 |
+| `0 30 23 * * ?` | 每天 23:30 执行 |
 
-执行流程：
+## 执行逻辑
+
+### 定时扩缩容
+
+Operator 监听到 `CronScale` 后，会注册两个 cron 任务：
+
+| 任务 | 来源字段 | 动作 |
+| --- | --- | --- |
+| 扩容任务 | `spec.add.scaleTime` | 将 Deployment 调整到 `spec.add.targetReplicas` |
+| 缩容任务 | `spec.minus.scaleTime` | 将 Deployment 调整到 `spec.minus.targetReplicas` |
+
+如果目标 Deployment 没有 HPA，Operator 直接更新 Deployment 的 Scale 子资源。
+
+如果目标 Deployment 有同名 HPA，Operator 会先更新 HPA：
 
 ```text
-获取 Deployment 当前镜像
+targetReplicas - oldMinReplicas = delta
+newMinReplicas = targetReplicas
+newMaxReplicas = oldMaxReplicas + delta
+```
+
+### 镜像预热
+
+镜像预热任务到时间后会执行下面流程：
+
+```text
+读取目标 Deployment 的第一个容器镜像
+        |
+        v
+列出集群所有节点
         |
         v
 查询 MySQL 中已有该镜像的节点
         |
         v
-计算还缺少镜像的节点
+计算缺少镜像的节点
         |
         v
-创建 Job 到指定节点执行 crictl pull
+创建临时 Job 并通过 NodeAffinity 调度到这些节点
         |
         v
-Job 完成后自动删除
+Job 中执行 crictl pull <deployment-image>
+        |
+        v
+Job 完成后删除临时 Job
 ```
 
-预热命令：
+预热 Job 依赖：
 
-```bash
-crictl pull <deployment-image>
-```
-
-#### 参数解释
-
-| 参数 | 说明 |
+| 依赖 | 说明 |
 | --- | --- |
-| `deployment-image` | 目标 Deployment 当前使用的镜像 |
-| `crictl pull` | 使用 containerd 拉取镜像 |
-| `NodeAffinity` | 控制预热 Job 只调度到缺少镜像的节点 |
-| `PodAntiAffinity` | 控制多个预热 Pod 尽量分散到不同节点 |
-| `cronscale-task-xxxxx` | Operator 创建的临时预热 Job |
+| `crictl` | 工具镜像内需要包含或挂载该命令 |
+| `/run/containerd` | 访问宿主机 containerd socket |
+| `/data/containerd` | 访问宿主机 containerd 数据目录 |
+| `/etc/crictl.yaml` | `crictl` 运行配置 |
 
-## 结果验证
+## 验证
 
-### CronScale CRD安装状况
+查看 CRD：
 
 ```bash
 kubectl get crd | grep cronscales
 ```
 
-正常结果：
-
-```text
-cronscales.application.liuchong.cn
-```
-
-### Operator运行状况
+查看 Operator：
 
 ```bash
-kubectl get pod -n cronscale-system
+kubectl get pod -n cronscale-operator-system
+kubectl logs -n cronscale-operator-system deploy/cronscale-operator-controller-manager -f
 ```
 
-正常结果：
-
-```text
-NAME                                                   READY   STATUS    RESTARTS   AGE
-cronscale-operator-controller-manager-xxxxxx           2/2     Running   0          1m
-```
-
-### cronscale-agent运行状况
+查看 agent：
 
 ```bash
-kubectl get ds -n liuchong
+kubectl get ds -n <namespace>
+kubectl logs -n <namespace> ds/cronscale-agent -f
 ```
 
-正常结果：
-
-```text
-NAME              DESIRED   CURRENT   READY   UP-TO-DATE   AVAILABLE
-cronscale-agent   3         3         3       3            3
-```
-
-### CronScale资源创建状况
+查看 CronScale：
 
 ```bash
-kubectl get crs -n liuchong
+kubectl get crs -n <namespace>
+kubectl describe crs <name> -n <namespace>
 ```
 
-正常结果：
-
-```text
-NAME    AGE
-nginx   1m
-```
-
-### Deployment扩容状况
+查看扩缩容结果：
 
 ```bash
-kubectl get deploy nginx -n liuchong
+kubectl get deploy <deployment-name> -n <namespace>
+kubectl get hpa <deployment-name> -n <namespace>
 ```
 
-到达扩容时间后，副本数会变成 `add.targetReplicas` 中配置的数量。
-
-```text
-NAME    READY   UP-TO-DATE   AVAILABLE   AGE
-nginx   5/5     5            5           10m
-```
-
-### Deployment缩容状况
+查看镜像预热 Job：
 
 ```bash
-kubectl get deploy nginx -n liuchong
-```
-
-到达缩容时间后，副本数会变成 `minus.targetReplicas` 中配置的数量。
-
-```text
-NAME    READY   UP-TO-DATE   AVAILABLE   AGE
-nginx   1/1     1            1           15m
-```
-
-### 镜像预热状况
-
-```bash
-kubectl get job -n liuchong
-```
-
-镜像预热执行时，会生成临时 Job。
-
-```text
-NAME                  COMPLETIONS   DURATION   AGE
-cronscale-task-abcde  3/3           20s        20s
-```
-
-查看 Job 日志：
-
-```bash
-kubectl logs -n liuchong job/cronscale-task-abcde
-```
-
-正常结果：
-
-```text
-pull done....
-```
-
-查看 Operator 日志：
-
-```bash
-kubectl logs -n cronscale-system deploy/cronscale-operator-controller-manager -f
-```
-
-正常结果：
-
-```text
-镜像预热完成
-清理Job Task完成
+kubectl get job -n <namespace>
+kubectl logs -n <namespace> job/<job-name>
 ```
 
 ## 常见问题
 
-### CronScale资源创建失败
+### CronScale 创建失败
 
-可能原因：
+| 现象 | 可能原因 | 处理方式 |
+| --- | --- | --- |
+| webhook 拒绝创建 | `add.targetReplicas <= minus.targetReplicas` | 调大扩容副本数或调小缩容副本数 |
+| webhook 拒绝创建 | `deploymentName` 为空 | 填写目标 Deployment 名称 |
+| webhook 拒绝创建 | cron 字段为空 | 填写 `add.scaleTime`、`minus.scaleTime`、`imagePullTime` |
+| 无法调用 webhook | webhook Pod、Service 或证书异常 | 检查 Operator Pod、`ValidatingWebhookConfiguration` 和 webhook Service |
 
-| 原因 | 处理方式 |
+### 扩缩容没有生效
+
+| 可能原因 | 处理方式 |
 | --- | --- |
-| `add.targetReplicas` 小于或等于 `minus.targetReplicas` | 调整扩容副本数，保证扩容副本数大于缩容副本数 |
-| `deploymentName` 为空 | 填写需要扩缩容的 Deployment 名称 |
-| `imagePullTime` 为空 | 填写镜像预热 cron 表达式 |
-| Webhook 未正常运行 | 检查 Controller Manager Pod 和 webhook 配置 |
+| CronScale 和 Deployment 不在同一命名空间 | 保持 `metadata.namespace` 与目标 Deployment namespace 一致 |
+| `deploymentName` 写错 | 使用 `kubectl get deploy -n <namespace>` 确认名称 |
+| cron 时间没有到达 | 临时改成更频繁的表达式验证 |
+| HPA 覆盖副本数 | 查看同名 HPA 的 `minReplicas` / `maxReplicas` 是否被更新 |
+| Operator 没有权限 | 检查 `config/rbac/role.yaml` 和 controller 日志 |
 
-### 镜像预热Job没有创建
+### 镜像预热 Job 没有创建
 
-可能原因：
-
-| 原因 | 处理方式 |
+| 可能原因 | 处理方式 |
 | --- | --- |
-| 没有部署 `cronscale-agent` | 先部署 `config/samples/Cronscale-agent.yaml` |
-| MySQL 中没有节点镜像数据 | 检查 agent 日志和数据库连接 |
-| 节点不是 containerd 运行时 | 根据实际运行时调整预热逻辑 |
-| containerd 路径不一致 | 检查 `/run/containerd`、`/data/containerd` 挂载路径 |
+| 未部署 agent | 部署 `config/samples/Cronscale-agent.yaml` |
+| MySQL DSN 未配置 | 配置 Operator 和 agent 的数据库连接 |
+| `cronscale_agent` 表没有数据 | 查看 agent 日志和 MySQL 写入情况 |
+| 节点运行时不是 containerd | 按实际运行时调整 agent 和预热 Job |
+| 宿主机路径不一致 | 检查 `/run/containerd`、`/data/containerd`、`/etc/crictl.yaml` |
 
-## 总结
+## 清理
 
-`CronScale-Operator` 的核心思路是把定时扩缩容规则抽象成 Kubernetes 自定义资源，由 Operator 负责监听资源并执行定时任务。
+```bash
+kubectl delete -f config/samples/application_v1_cronscale.yaml
+kubectl delete -f config/samples/Cronscale-agent.yaml
+make undeploy
+make uninstall
+```
 
-对于流量周期比较明显的业务，只需要维护一份 `CronScale` YAML，就可以实现定时扩容、定时缩容和镜像预热。相比人工操作，这种方式更加稳定，也更容易接入 GitOps 流程。
+## 安全说明
+
+- 不要把 kubeconfig、MySQL DSN、镜像仓库账号密码、私钥或证书提交到仓库。
+- 建议使用 Kubernetes Secret 注入数据库连接串和镜像仓库凭据。
+- 公开示例中的 `example.com`、空 `dsn`、空 `kubeconfig` 都需要在真实环境中替换。
+- `.gitignore` 已包含 `.env`、`*.pem`、`*.key`、`*kubeconfig*` 等敏感文件模式。
