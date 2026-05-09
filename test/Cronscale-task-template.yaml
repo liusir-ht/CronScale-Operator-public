@@ -1,0 +1,58 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: 'indexed-job'
+  namespace: liuchong
+spec:
+  completions: 2
+  parallelism: 2
+  completionMode: Indexed
+  template:
+    spec:
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+          - labelSelector:
+              matchExpressions:
+              - key: job-name
+                operator: In
+                values:
+                - indexed-job
+            topologyKey: kubernetes.io/hostname
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:  # 硬策略
+            nodeSelectorTerms:
+            - matchExpressions:
+              - key: kubernetes.io/hostname
+                operator: In
+                values:
+                - node-1
+      restartPolicy: Never
+      containers:
+      - name: cronscale-task
+        imagePullPolicy: IfNotPresent
+        image: example.com/library/cronscale-task:3.16
+        command: ["/bin/sh"]
+        args: ["-c", "crictl pull docker.io/library/nginx:1.16;sleep 10;echo pull done...."]
+        volumeMounts:
+        - name: containerd-data
+          mountPath:  /data/containerd
+        - name: containerd-socket
+          mountPath: /run/containerd
+        - name: crictl
+          mountPath: /usr/local/bin/crictl
+        - name: crictl-conf
+          mountPath: /etc/crictl.yaml
+      volumes:
+      - name: containerd-data
+        hostPath:
+           path: /data/containerd
+      - name: containerd-socket
+        hostPath:
+           path: /run/containerd
+      - name: crictl
+        hostPath:
+           path: /usr/local/bin/crictl
+      - name: crictl-conf
+        hostPath:
+           path: /etc/crictl.yaml

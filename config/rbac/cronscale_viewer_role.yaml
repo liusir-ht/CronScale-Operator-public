@@ -1,0 +1,27 @@
+# permissions for end users to view cronscales.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  labels:
+    app.kubernetes.io/name: clusterrole
+    app.kubernetes.io/instance: cronscale-viewer-role
+    app.kubernetes.io/component: rbac
+    app.kubernetes.io/created-by: cronscale-operator
+    app.kubernetes.io/part-of: cronscale-operator
+    app.kubernetes.io/managed-by: kustomize
+  name: cronscale-viewer-role
+rules:
+- apiGroups:
+  - application.liuchong.cn
+  resources:
+  - cronscales
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - application.liuchong.cn
+  resources:
+  - cronscales/status
+  verbs:
+  - get

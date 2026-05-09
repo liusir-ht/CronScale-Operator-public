@@ -1,0 +1,17 @@
+apiVersion: application.liuchong.cn/v1
+kind: CronScale
+metadata:
+  name: nginx
+  namespace: liuchong
+  labels:
+    env: test
+spec:
+  foo: CronScale-test
+  minus:
+    targetReplicas: 1
+    scaleTime: "0 */3 * * * ?"
+  add:
+    targetReplicas: 5
+    scaleTime: "0 */5 * * * ?"
+  deploymentName: "nginx"
+  imagePullTime: "0 */1 * * * ?"

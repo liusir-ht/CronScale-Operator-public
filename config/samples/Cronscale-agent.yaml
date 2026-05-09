@@ -1,0 +1,51 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  labels:
+    app: cronscale-agent
+  name: cronscale-agent
+  namespace: liuchong
+spec:
+  selector:
+    matchLabels:
+      app: cronscale-agent
+  template:
+    metadata:
+      labels:
+        app: cronscale-agent
+    spec:
+      containers:
+        - image: example.com/library/cronscale-agent:1.0.2
+          volumeMounts:
+          - name: containerd-data
+            mountPath:  /data/containerd
+          - name: containerd-socket
+            mountPath: /run/containerd
+          imagePullPolicy: IfNotPresent
+          env:
+          - name: nodeName
+            valueFrom:
+             fieldRef:
+              fieldPath: spec.nodeName
+          name: cronscale-agent
+          resources:
+            limits:
+              memory: 50Mi
+            requests:
+              cpu: 50m
+              memory: 30Mi
+          terminationMessagePath: /dev/termination-log
+          terminationMessagePolicy: File
+      dnsPolicy: ClusterFirst
+      restartPolicy: Always
+      schedulerName: default-scheduler
+      securityContext: {}
+      terminationGracePeriodSeconds: 30
+      volumes:
+        - name: containerd-data
+          hostPath:
+            path: /data/containerd
+        - name: containerd-socket
+          hostPath:
+            path: /run/containerd
+

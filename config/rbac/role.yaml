@@ -1,0 +1,32 @@
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: manager-role
+rules:
+- apiGroups:
+  - application.liuchong.cn
+  resources:
+  - cronscales
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - application.liuchong.cn
+  resources:
+  - cronscales/finalizers
+  verbs:
+  - update
+- apiGroups:
+  - application.liuchong.cn
+  resources:
+  - cronscales/status
+  verbs:
+  - get
+  - patch
+  - update
