@@ -6,6 +6,35 @@
 
 `CronScale Operator` 使用 Kubernetes CRD 描述定时扩缩容规则，由 Operator 监听 `CronScale` 资源并在指定时间执行动作。除了调整 Deployment 副本数，它还支持在扩容前提前把业务镜像拉取到目标节点，降低 Pod 启动时的镜像拉取等待时间。
 
+## 项目信息
+
+| 项目 | 内容 |
+| --- | --- |
+| 项目名称 | CronScale Operator |
+| Git 地址 | `https://github.com/liusir-ht/CronScale-Operator-public.git` |
+| 主模块 | `liuchong.cn/m` |
+| agent 模块 | `cronscale-agent` |
+| CRD Group | `application.liuchong.cn` |
+| CRD Version | `v1` |
+| CRD Kind | `CronScale` |
+| CRD ShortName | `crs` |
+| 默认部署命名空间 | `cronscale-operator-system` |
+| 开发框架 | Kubebuilder / controller-runtime |
+
+拉取项目：
+
+```bash
+git clone https://github.com/liusir-ht/CronScale-Operator-public.git
+cd CronScale-Operator-public
+```
+
+如果使用 SSH：
+
+```bash
+git clone git@github.com:liusir-ht/CronScale-Operator-public.git
+cd CronScale-Operator-public
+```
+
 ## 功能概览
 
 | 功能 | 说明 |
@@ -15,6 +44,151 @@
 | HPA 兼容 | 如果目标 Deployment 配置了同名 HPA，扩缩容时同步调整 HPA 的 `minReplicas` 和 `maxReplicas` |
 | 镜像预热 | 到达 `spec.imagePullTime` 后，计算缺少目标镜像的节点，并创建临时 Job 执行 `crictl pull` |
 | 任务清理 | 删除 `CronScale` 资源时，清理该资源注册过的 cron 任务 |
+
+## 适用场景
+
+这个 Operator 更适合下面几类场景：
+
+| 场景 | 说明 |
+| --- | --- |
+| 业务流量有固定峰谷 | 例如每天早上提前扩容，晚上自动缩容 |
+| 扩容时镜像较大 | 通过镜像预热减少 Pod 首次启动时的镜像拉取耗时 |
+| 希望通过 YAML 管理规则 | 扩缩容规则可以和业务资源一起进入 GitOps 流程 |
+| 部署对象是 Deployment | 当前实现以 Deployment 为目标资源 |
+| 集群使用 containerd | 当前镜像预热逻辑默认访问 containerd socket |
+
+不适合的场景：
+
+| 场景 | 原因 |
+| --- | --- |
+| 流量完全不可预测 | 更适合使用 HPA、KEDA 或事件驱动扩缩容 |
+| 目标资源不是 Deployment | 当前代码没有实现 StatefulSet、DaemonSet 等资源的扩缩容 |
+| 节点运行时不是 containerd | 镜像预热部分需要适配实际运行时 |
+
+## 部署模式
+
+这个项目可以按功能拆成两种部署模式。
+
+### 只使用定时扩缩容
+
+如果只需要定时调整 Deployment 副本数，依赖最少，只需要：
+
+| 依赖 | 说明 |
+| --- | --- |
+| Kubernetes 集群 | 运行 CRD、Controller、RBAC、Webhook |
+| Operator 镜像 | 运行 controller-manager |
+| 目标 Deployment | 被扩缩容的业务 Deployment |
+| CronScale YAML | 声明扩容时间、缩容时间和目标副本数 |
+
+这种模式不需要 MySQL、`cronscale-agent`、containerd socket，也不需要镜像预热 Job。
+
+### 使用定时扩缩容 + 镜像预热
+
+如果还要在扩容前提前拉取镜像，需要额外准备：
+
+| 依赖 | 说明 |
+| --- | --- |
+| MySQL | 保存节点和镜像之间的关系 |
+| cronscale-agent 镜像 | 每个节点运行一个 agent，上报节点已有镜像 |
+| cronscale-task 镜像 | 临时 Job 使用，负责执行 `crictl pull` |
+| containerd socket | agent 和预热 Job 访问宿主机运行时 |
+| crictl 配置 | 确保 Job 能正确连接 containerd 并拉取镜像 |
+
+推荐先跑通“只使用定时扩缩容”，确认 CRD、RBAC、Webhook 和 Deployment 扩缩容正常后，再启用镜像预热。
+
+## 依赖说明
+
+### 本地开发依赖
+
+| 依赖 | 建议版本 | 用途 | 说明 |
+| --- | --- | --- | --- |
+| Git | 2.x+ | 拉取和提交代码 | 需要能访问 GitHub |
+| Go | 1.21+ | 编译 Operator 和 agent | `go.mod` 中声明 `go 1.21` |
+| Docker / Podman | 17.03+ | 构建镜像 | Makefile 默认使用 `docker`，可通过 `CONTAINER_TOOL` 覆盖 |
+| kubectl | 与集群版本兼容 | 安装 CRD、部署资源、查看状态 | Makefile 默认调用 `kubectl` |
+| make | 系统自带即可 | 执行构建、部署目标 | 依赖项目根目录 `Makefile` |
+| kustomize | v5.3.0 | 渲染 Kubernetes YAML | Makefile 会安装到 `bin/` |
+| controller-gen | v0.14.0 | 生成 CRD、RBAC、Webhook 配置 | Makefile 会安装到 `bin/` |
+| golangci-lint | v1.54.2 | 代码检查 | 执行 `make lint` 时使用 |
+
+### Kubernetes 集群依赖
+
+| 依赖 | 建议 | 用途 |
+| --- | --- | --- |
+| Kubernetes | 兼容 `k8s.io/* v0.29.0` 的集群版本 | 运行 CRD、Controller、Webhook、Job、DaemonSet |
+| RBAC | 开启 | Operator 需要访问 Deployment、HPA、Node、Job、CronScale 等资源 |
+| Admission Webhook | 开启 | 用于校验 CronScale 创建和更新 |
+| ServiceAccount | 默认由 Kustomize 创建 | Controller 在集群内访问 Kubernetes API |
+| cert-manager | 可选 | 如果启用 cert-manager patch，可由 cert-manager 管理 webhook 证书 |
+| Prometheus Operator | 可选 | 如果启用 `config/prometheus`，可采集 controller metrics |
+
+### 镜像预热依赖
+
+镜像预热不是定时扩缩容的必需能力。如果只使用定时扩缩容，可以不部署 MySQL 和 `cronscale-agent`。
+
+| 依赖 | 是否必需 | 说明 |
+| --- | --- | --- |
+| MySQL | 使用镜像预热时必需 | 保存节点和镜像之间的关系 |
+| cronscale-agent | 使用镜像预热时必需 | DaemonSet 方式运行在每个节点，上报节点已有镜像 |
+| containerd | 使用镜像预热时必需 | agent 通过 containerd API 读取本机镜像列表 |
+| `/run/containerd` | 使用镜像预热时必需 | 挂载宿主机 containerd socket |
+| `/data/containerd` | 按实际集群配置 | 示例中挂载宿主机 containerd 数据目录 |
+| `crictl` | 预热 Job 必需 | Job 里执行 `crictl pull <image>` |
+| `/etc/crictl.yaml` | 预热 Job 按需 | 如果工具镜像不内置配置，需要从宿主机挂载 |
+
+### Go 核心依赖
+
+Operator 主模块的核心依赖：
+
+| 依赖 | 版本 | 用途 |
+| --- | --- | --- |
+| `sigs.k8s.io/controller-runtime` | `v0.17.2` | Operator 框架，负责 manager、controller、webhook 等能力 |
+| `k8s.io/api` | `v0.29.0` | Kubernetes API 类型 |
+| `k8s.io/apimachinery` | `v0.29.0` | Kubernetes 元数据、runtime、schema 等基础库 |
+| `k8s.io/client-go` | `v0.29.0` | 访问 Kubernetes API |
+| `github.com/containerd/containerd` | `v1.7.16` | 访问 containerd 镜像信息 |
+| `github.com/go-sql-driver/mysql` | `v1.8.1` | MySQL 驱动 |
+| `github.com/jmoiron/sqlx` | `v1.4.0` | MySQL 访问封装 |
+| `go.uber.org/zap` | `v1.26.0` | 日志 |
+| `github.com/onsi/ginkgo/v2` | `v2.14.0` | 测试框架 |
+| `github.com/onsi/gomega` | `v1.30.0` | 测试断言 |
+
+agent 模块的核心依赖：
+
+| 依赖 | 版本 | 用途 |
+| --- | --- | --- |
+| `github.com/containerd/containerd` | `v1.7.16` | 读取节点本地镜像 |
+| `github.com/go-sql-driver/mysql` | `v1.8.1` | MySQL 驱动 |
+| `github.com/jmoiron/sqlx` | `v1.4.0` | 写入节点镜像信息 |
+| `github.com/robfig/cron/v3` | `v3.0.1` | agent 内部定时扫描 |
+| `go.uber.org/zap` | `v1.27.0` | 日志 |
+
+### 组件依赖关系
+
+```text
+CronScale CR
+    |
+    v
+Controller Manager
+    |
+    +-- Kubernetes API: 查询/更新 Deployment、HPA、Node、Job
+    |
+    +-- MySQL: 查询节点镜像数据
+    |
+    +-- Cron: 注册扩容、缩容、镜像预热任务
+
+cronscale-agent
+    |
+    +-- containerd socket: 读取节点已有镜像
+    |
+    +-- MySQL: 写入 nodeName 和 imageName
+
+image-preload Job
+    |
+    +-- crictl: 拉取目标 Deployment 镜像
+    |
+    +-- containerd socket: 写入宿主机镜像缓存
+```
 
 ## 架构
 
@@ -51,6 +225,24 @@ CronScale Controller
 | MySQL Client | `pkg/client.go`、`cronscale-agent/main.go` | 连接 MySQL，读写节点镜像信息 |
 | cronscale-agent | `cronscale-agent/main.go` | 以 DaemonSet 方式运行，定时上报节点已有镜像 |
 
+## 目录结构
+
+```text
+.
+├── api/v1                         # CronScale API 类型和 webhook
+├── cmd/main.go                    # controller-manager 入口
+├── config                         # CRD、RBAC、manager、webhook、sample 等部署配置
+├── cronscale-agent                # 节点镜像采集 agent
+├── internal/controller            # CronScale controller 核心逻辑
+├── module                         # 数据模型
+├── pkg                            # Kubernetes、cron、HPA、MySQL 等工具封装
+├── test                           # e2e 和测试模板
+├── Dockerfile                     # Operator 镜像构建文件
+├── Makefile                       # 构建、测试、部署入口
+├── PROJECT                        # Kubebuilder 项目配置
+└── CronScale-Operator.md          # 当前说明文档
+```
+
 ## 部署前初始化参数
 
 公开仓库不会提交真实 kubeconfig、数据库账号密码、私有镜像仓库地址或内网节点信息。部署前需要按环境补齐下面这些参数。
@@ -65,6 +257,19 @@ CronScale Controller
 | `KUBECONFIG` | 本地运行必填 | `~/.kube/config` | `pkg/client.go` | 本地调试时使用；集群内运行建议使用 ServiceAccount |
 | `CONTAINERD_SOCKET` | 镜像预热必填 | `/run/containerd/containerd.sock` | `pkg/client.go`、`cronscale-agent/main.go`、DaemonSet volume | 连接宿主机 containerd |
 | `CONTAINERD_DATA` | 镜像预热按需 | `/data/containerd` | `config/samples/Cronscale-agent.yaml`、预热 Job volume | 挂载宿主机 containerd 数据目录 |
+
+部署前检查清单：
+
+| 检查项 | 命令 | 预期 |
+| --- | --- | --- |
+| Git 可用 | `git --version` | 能正常输出版本 |
+| Go 可用 | `go version` | 版本不低于 1.21 |
+| Docker 可用 | `docker version` | 能连接到 Docker daemon |
+| kubectl 可用 | `kubectl version --client` | 能输出客户端版本 |
+| 集群可访问 | `kubectl get node` | 能看到节点列表 |
+| 当前上下文正确 | `kubectl config current-context` | 指向目标集群 |
+| 镜像仓库可推送 | `docker push <image>` | 能成功推送镜像 |
+| containerd 路径正确 | 在节点上确认 `/run/containerd/containerd.sock` | socket 存在 |
 
 当前代码中需要重点替换的示例值：
 
@@ -115,6 +320,21 @@ cronscale:password@tcp(mysql.cronscale-system.svc:3306)/cronscale?charset=utf8mb
 | 数据保留 | 当前 agent 会删除 5 秒未刷新的记录，确保 agent 正常运行后再启用镜像预热 |
 
 ## 构建和部署
+
+### 0. 拉取代码
+
+```bash
+git clone https://github.com/liusir-ht/CronScale-Operator-public.git
+cd CronScale-Operator-public
+```
+
+确认本地依赖：
+
+```bash
+go version
+docker version
+kubectl get node
+```
 
 ### 1. 构建 Operator 镜像
 
