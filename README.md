@@ -149,4 +149,4 @@ make uninstall
 
 Copyright 2024 liuchong.
 
-Licensed under the Apache License, Version 2.0.
+Licensed under the MIT License.
